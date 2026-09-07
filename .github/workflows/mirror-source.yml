@@ -1,6 +1,7 @@
 name: Mirror proxyip
 
 on:
+  push:
   workflow_dispatch:
 
 permissions:
