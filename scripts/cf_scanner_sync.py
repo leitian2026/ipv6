@@ -3,6 +3,7 @@ import random
 import socket
 import time
 import re
+import ipaddress
 import requests
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
@@ -28,10 +29,22 @@ DEFAULT_REGIONS = "SJC"
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
 # 设置为 "NO": 关闭！仅同步到各个地区子域名，不修改主域名的解析记录
 SYNC_MAIN_DOMAIN = "NO"
+
+# 📄 结果保存文件名（同时也是下一轮"热点网段"学习的数据来源）
+# 之前固定叫 ips-v4.txt，现在改成 ips-v6.txt。
+# 如果你想两种都测（ip.txt 里混合写 v4 和 v6 网段），这个文件名随便起，脚本会自动按每个 IP
+# 自身的版本去分类处理，不影响功能。
+RESULT_FILE = "ips-v6.txt"
+
+# 🧠 热点网段学习粒度
+# IPv4 用 /24（256 个地址一组），IPv6 网段巨大，粒度太细起不到"聚焦"效果，
+# 默认用 /48（这是很多运营商给单个用户分配的典型大小），可按需调整成 /56 或 /64。
+HOT_SUBNET_PREFIX_V4 = 24
+HOT_SUBNET_PREFIX_V6 = 48
 # ==========================================
 
-    # === Cloudflare IPv4 Ranges (IP段配置区) ===
-    # 现在完全从根目录的 ip.txt 文件读取
+    # === Cloudflare IP Ranges (IP段配置区) ===
+    # 现在完全从根目录的 ip.txt 文件读取，v4/v6 CIDR 均可，脚本会自动识别
 def load_cf_cidrs(file_path="ip.txt"):
     if not os.path.exists(file_path):
         print(f"Error: 找不到 {file_path} 文件！请确保该文件存在并填写了需要扫描的 IP 段。")
@@ -52,46 +65,31 @@ CF_CIDRS = load_cf_cidrs()
 
 def generate_random_ip(hot_cidrs=None):
     # 如果有热点网段，并且掷骰子命中 50% 概率，就从热点网段里抽；否则从大网段抽
+    # 用 ipaddress 模块统一处理，自动兼容 IPv4 / IPv6 CIDR（不用再手写位运算）
     for _ in range(10): # 避免死循环，最多重试 10 次
         try:
             if hot_cidrs and random.random() < 0.5:
                 cidr = random.choice(hot_cidrs)
             else:
                 cidr = random.choice(CF_CIDRS)
-                
-            if '/' in cidr:
-                base_ip, prefix = cidr.split('/')
-                prefix = int(prefix)
-            else:
-                base_ip = cidr
-                prefix = 32
-            
-            parts = list(map(int, base_ip.split('.')))
-            if len(parts) != 4:
-                continue
-                
-            ip_long = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
-            
-            host_bits = 32 - prefix
-            mask = (1 << host_bits) - 1
-            random_host = random.randint(0, mask)
-            
-            final_ip_long = (ip_long & ~mask) | random_host
-            
-            p1 = (final_ip_long >> 24) & 255
-            p2 = (final_ip_long >> 16) & 255
-            p3 = (final_ip_long >> 8) & 255
-            p4 = final_ip_long & 255
-            
-            return f"{p1}.{p2}.{p3}.{p4}"
+
+            network = ipaddress.ip_network(cidr, strict=False)
+
+            # IPv6 网段可能巨大（比如 /32 有 2^96 个地址），Python 原生大整数运算完全没问题
+            random_offset = random.randint(0, network.num_addresses - 1)
+            random_ip = network.network_address + random_offset
+
+            return str(random_ip)
         except Exception:
             continue
-            
-    return "1.1.1.1" # 兜底返回，防止崩溃
+
+    # 兜底返回，防止崩溃（Cloudflare 官方 IPv6 anycast 地址之一，仅作占位，不代表真实优选结果）
+    return "2606:4700:4700::1111"
 
 def test_ip(ip, check_api_url, timeout=5.0):
     start_time = time.time()
     try:
+        # IPv6 地址里的冒号在 query string 里是合法字符（RFC 3986），无需额外加方括号或编码
         url = f"{check_api_url}?proxyip={ip}"
         
         resp = requests.get(url, timeout=timeout).json()
@@ -109,64 +107,87 @@ def test_ip(ip, check_api_url, timeout=5.0):
         pass
     return None
 
+def get_dns_record_type(ip_str):
+    """根据 IP 本身自动判断该写 A 记录还是 AAAA 记录"""
+    try:
+        return "AAAA" if ipaddress.ip_address(ip_str).version == 6 else "A"
+    except ValueError:
+        return "A"
+
 def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email):
     headers = {
         "X-Auth-Email": cf_email,
         "X-Auth-Key": api_token,
         "Content-Type": "application/json"
     }
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={target_domain}"
-    
-    print(f"Fetching existing DNS records for {target_domain}...")
-    try:
-        resp = requests.get(url, headers=headers).json()
-        if not resp.get("success"):
-            print("Failed to fetch DNS records:", resp)
-            return False
-        
-        existing_records = resp.get("result", [])
-        existing_map = {r["content"]: r["id"] for r in existing_records}
-        desired_ips = [ip["ip"] for ip in best_ips]
-        
-        # 1. Delete records that are no longer in our best_ips list
-        for ip_val, record_id in existing_map.items():
-            if ip_val not in desired_ips:
-                print(f"Deleting outdated IP: {ip_val}")
-                del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-                requests.delete(del_url, headers=headers)
-                
-        # 2. Add new IPs
-        for ip_val in desired_ips:
-            if ip_val not in existing_map:
-                print(f"Adding new IP: {ip_val}")
-                post_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-                data = {
-                    "type": "A",
-                    "name": target_domain,
-                    "content": ip_val,
-                    "ttl": 60,  # Auto/1 minute
-                    "proxied": False
-                }
-                requests.post(post_url, headers=headers, json=data)
-                
+
+    # best_ips 里可能混有 IPv4 和 IPv6（取决于 ip.txt 怎么配置），
+    # Cloudflare 的 A / AAAA 是两种独立的记录类型，必须分开查询、分开同步，不能混用同一个 type 参数。
+    ips_by_type = {"A": [], "AAAA": []}
+    for ip_info in best_ips:
+        ips_by_type[get_dns_record_type(ip_info["ip"])].append(ip_info["ip"])
+
+    overall_success = True
+
+    for record_type, desired_ips in ips_by_type.items():
+        if not desired_ips:
+            continue
+
+        url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={target_domain}"
+
+        print(f"Fetching existing {record_type} records for {target_domain}...")
+        try:
+            resp = requests.get(url, headers=headers).json()
+            if not resp.get("success"):
+                print(f"Failed to fetch {record_type} DNS records:", resp)
+                overall_success = False
+                continue
+
+            existing_records = resp.get("result", [])
+            existing_map = {r["content"]: r["id"] for r in existing_records}
+
+            # 1. Delete records that are no longer in our best_ips list
+            for ip_val, record_id in existing_map.items():
+                if ip_val not in desired_ips:
+                    print(f"Deleting outdated {record_type} IP: {ip_val}")
+                    del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+                    requests.delete(del_url, headers=headers)
+
+            # 2. Add new IPs
+            for ip_val in desired_ips:
+                if ip_val not in existing_map:
+                    print(f"Adding new {record_type} IP: {ip_val}")
+                    post_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
+                    data = {
+                        "type": record_type,
+                        "name": target_domain,
+                        "content": ip_val,
+                        "ttl": 60,  # Auto/1 minute
+                        "proxied": False
+                    }
+                    requests.post(post_url, headers=headers, json=data)
+
+        except Exception as e:
+            print(f"Exception during Cloudflare {record_type} sync: {e}")
+            overall_success = False
+
+    if overall_success:
         print("Cloudflare DNS Sync completed successfully!")
-        return True
-    except Exception as e:
-        print(f"Exception during Cloudflare sync: {e}")
-        return False
+    return overall_success
 
 def save_ips_to_file(best_ips):
     # Calculate Beijing Time (UTC+8)
     bj_time = datetime.now(timezone.utc) + timedelta(hours=8)
     time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
     
-    with open("ips-v4.txt", "w", encoding="utf-8") as f:
+    with open(RESULT_FILE, "w", encoding="utf-8") as f:
         # 写入纯 IP 和 地区备注，格式为 IP#地区
         # 很多代理/机场客户端使用 # 作为节点备注的分隔符
+        # （IPv6 地址本身带冒号，这个格式不受影响，客户端按最后一个 # 分隔即可识别）
         for ip in best_ips:
             f.write(f"{ip['ip']}#{ip['colo']}\n")
             
-    print("Successfully saved latest IPs to ips-v4.txt")
+    print(f"Successfully saved latest IPs to {RESULT_FILE}")
 
 def main():
     api_token = os.environ.get("CF_API_TOKEN")
@@ -191,20 +212,24 @@ def main():
     sync_count = int(os.environ.get("SYNC_COUNT", 10))
     scan_count = int(os.environ.get("SCAN_COUNT", 2000))
     
-    # === 从 ips-v4.txt 中提取历史优秀 IP 段 (/24) ===
+    # === 从 RESULT_FILE 中提取历史优秀 IP 段 (自动按 v4/v6 分别用不同粒度) ===
     hot_cidrs = []
-    if os.path.exists("ips-v4.txt"):
+    if os.path.exists(RESULT_FILE):
         try:
-            with open("ips-v4.txt", "r", encoding="utf-8") as f:
+            with open(RESULT_FILE, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         ip_str = line.split("#")[0]
-                        parts = ip_str.split(".")
-                        if len(parts) == 4:
-                            hot_cidrs.append(f"{parts[0]}.{parts[1]}.{parts[2]}.0/24")
+                        try:
+                            ip_obj = ipaddress.ip_address(ip_str)
+                            prefix = HOT_SUBNET_PREFIX_V6 if ip_obj.version == 6 else HOT_SUBNET_PREFIX_V4
+                            hot_net = ipaddress.ip_network(f"{ip_obj}/{prefix}", strict=False)
+                            hot_cidrs.append(str(hot_net))
+                        except ValueError:
+                            continue
             hot_cidrs = list(set(hot_cidrs))
-            print(f"Loaded {len(hot_cidrs)} hot /24 subnets from ips-v4.txt for targeted scanning.")
+            print(f"Loaded {len(hot_cidrs)} hot subnets from {RESULT_FILE} for targeted scanning.")
         except Exception as e:
             pass
     
