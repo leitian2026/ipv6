@@ -1,0 +1,20 @@
+name: Mirror proxyip
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror source repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --mirror https://github.com/leitian2026/proxyip.git source.git
+          cd source.git
+          git remote set-url --push origin https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+          git push --mirror
