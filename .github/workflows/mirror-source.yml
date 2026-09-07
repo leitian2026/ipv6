@@ -6,17 +6,19 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror source repository
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+      - name: Copy source files
         run: |
-          git clone --mirror https://github.com/leitian2026/proxyip.git source.git
-          cd source.git
-          git remote set-url --push origin https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-          git push --mirror
+          git clone https://github.com/leitian2026/proxyip.git source
+          rsync -a --delete --exclude='.git' --exclude='.github/workflows/cf-auto-sync.yml' source/ ./
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m '完整复制 proxyip 源码' || true
+          git push
