@@ -1,0 +1,8 @@
+{
+  "name": "CF扫描器网页版本",
+  "description": "High-speed Cloudflare IP testing tool with local scanning and history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
