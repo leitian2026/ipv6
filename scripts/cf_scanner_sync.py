@@ -56,7 +56,7 @@ HOT_16_WEIGHT = 0.25
 # "4" = 只扫描IPv4（默认，行为和以前完全一致，用的还是 ip.txt / ips-v4.txt）
 # "6" = 只扫描IPv6（自动改用 ip6.txt / ips-v6.txt，互不干扰）
 # 不支持一次运行同时混测两种版本；两种都要测就分开跑两次，各自独立维护自己的CIDR池和历史文件。
-IP_VERSION = "4"
+IP_VERSION = "6"
 
 # 根据 IP_VERSION 自动派生要用的文件名和CF记录类型，不需要额外手动改别的地方
 _IP_FILE = "ip.txt" if IP_VERSION == "4" else "ip6.txt"
